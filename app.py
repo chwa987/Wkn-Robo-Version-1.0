@@ -1,16 +1,18 @@
 # app.py
-# Momentum-RoboAdvisor v1.3.4
-# Analyse + Handlungsempfehlungen + Backtest (monatlich, 1. Handelstag)
-# Marktübersicht: Anteil > GD200 und Rundungsregel (>= .5 aufrunden)
-# Backtest investiert exakt "invest_n" gleichgewichtet. Kein Teil-Cash.
+# Momentum-RoboAdvisor v1.3-Exposure (alter Stand + GD-Filter + invest_n + %>GD200)
+# - Analyse mit Momentum-Score (260/130), RS z, Volumen-Score, 52W-Drawdown, Volatilität
+# - Handlungsempfehlungen: Kauf nur wenn Rank≤invest_n UND über GD50 UND über GD200
+# - Marktübersicht: Anteil > GD200 in % und Investitionsanzahl nach Rundungsregel
+# - Backtest: Rebalancing am Monatsanfang (MS) oder wöchentlich (erster Handelstag),
+#             Equal-Weight, investiert genau invest_n Titel, Kosten optional
 
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-import math
 
 st.set_page_config(page_title="Momentum-RoboAdvisor", layout="wide")
 
@@ -27,7 +29,6 @@ def fetch_ohlc(ticker_list, start, end):
     tickers = list(dict.fromkeys(tickers))
     if not tickers:
         return pd.DataFrame(), pd.DataFrame()
-
     try:
         data = yf.download(
             tickers=" ".join(tickers),
@@ -48,7 +49,7 @@ def fetch_ohlc(ticker_list, start, end):
             df = data[t].copy() if isinstance(data.columns, pd.MultiIndex) else data.copy()
         except Exception:
             df = data.copy()
-        if df.empty:
+        if df is None or df.empty:
             continue
         closes = (df["Adj Close"] if "Adj Close" in df.columns else df.get("Close"))
         vols = df.get("Volume")
@@ -63,7 +64,6 @@ def fetch_ohlc(ticker_list, start, end):
     volume = volume.reindex(price.index)
     return price, volume
 
-
 def pct_change_over_window(series: pd.Series, days: int) -> float:
     s = series.dropna()
     if len(s) < days + 1:
@@ -74,18 +74,15 @@ def pct_change_over_window(series: pd.Series, days: int) -> float:
         return np.nan
     return (end_val / start_val - 1.0) * 100.0
 
-
 def safe_sma(series: pd.Series, window: int) -> pd.Series:
     if series is None or series.empty:
         return series
     return series.rolling(window=window, min_periods=max(5, window // 5)).mean()
 
-
 def zscore_last(value: float, mean: float, std: float) -> float:
     if std is None or std == 0 or np.isnan(std):
         return 0.0
     return (value - mean) / std
-
 
 def volume_score(vol_series: pd.Series, lookback=60):
     if vol_series is None or vol_series.dropna().empty:
@@ -96,12 +93,10 @@ def volume_score(vol_series: pd.Series, lookback=60):
         return np.nan
     return float(np.clip(cur / base, 0.5, 2.0))
 
-
 def logp(x):
     if pd.isna(x):
         return np.nan
     return np.sign(x) * np.log1p(abs(x))
-
 
 # =========================
 # Indikatoren + Score
@@ -109,11 +104,12 @@ def logp(x):
 
 def compute_indicators(price_df: pd.DataFrame, volume_df: pd.DataFrame, benchmark_df=None):
     results = []
-
+    # Cross-sectional RS (130T) im Universum
     mom130_universe = {t: pct_change_over_window(price_df[t], 130) for t in price_df.columns}
     mom130_series = pd.Series(mom130_universe).astype(float)
     mu, sigma = mom130_series.mean(), mom130_series.std(ddof=0)
 
+    # Benchmark 130T-Return
     bm_return = None
     if benchmark_df is not None and not benchmark_df.empty:
         bm_return = pct_change_over_window(benchmark_df.iloc[:, 0], 130)
@@ -130,8 +126,8 @@ def compute_indicators(price_df: pd.DataFrame, volume_df: pd.DataFrame, benchmar
 
         mom260 = pct_change_over_window(s, 260)
         mom130 = pct_change_over_window(s, 130)
-
         rs_z = zscore_last(mom130, mu, sigma) if not np.isnan(mom130) else 0.0
+
         vol_sc = volume_score(v, 60)
         avg_vol = v.rolling(60).mean().iloc[-1] if not v.empty else np.nan
 
@@ -181,65 +177,54 @@ def compute_indicators(price_df: pd.DataFrame, volume_df: pd.DataFrame, benchmar
     df["Rank"] = np.arange(1, len(df) + 1)
     return df
 
+# =========================
+# Rebalancing-Termine
+# =========================
+
+def weekly_first_trading_days(idx: pd.DatetimeIndex):
+    s = pd.Series(1, index=idx)
+    grp = s.groupby(pd.Grouper(freq="W-MON"))  # Wochen ab Montag
+    return [g.index[0] for _, g in grp if not g.empty]
+
+def monthly_first_trading_days(idx: pd.DatetimeIndex):
+    s = pd.Series(1, index=idx)
+    grp = s.groupby(pd.Grouper(freq="MS"))  # Monatsanfang (Month Start)
+    return [g.index[0] for _, g in grp if not g.empty]
 
 # =========================
-# Rundungsregel: invest_n
+# Rundungsregel (invest_n)
 # =========================
 
 def invest_count_from_share(share: float, top_n: int) -> int:
-    """Normales Runden: >= .5 aufrunden, sonst abrunden. Geklemmt auf [0, top_n]."""
     raw = share * top_n
-    inv = int(math.floor(raw + 0.5))
+    inv = int(math.floor(raw + 0.5))  # .5 aufrunden
     return max(0, min(inv, top_n))
 
-
 # =========================
-# Backtest (monatlich)
+# Backtest
 # =========================
 
-def first_trading_days_monthly(idx: pd.DatetimeIndex) -> list:
-    s = pd.Series(1, index=idx)
-    grp = s.groupby(pd.Grouper(freq="MS"))
-    return [g.index[0] for _, g in grp if not g.empty]
+def run_backtest(prices, volumes, benchmark, start_date, end_date,
+                 top_n=10, min_volume=5_000_000, max_dd52=-30,
+                 max_volatility=1.0, apply_benchmark=True,
+                 cost_bps=10.0, slippage_bps=5.0, mode="monthly"):
 
-
-def run_backtest_monthly(prices: pd.DataFrame,
-                         volumes: pd.DataFrame,
-                         benchmark: pd.Series | None,
-                         start_date,
-                         end_date,
-                         top_n=10,
-                         min_volume=5_000_000,
-                         max_dd52=-30,
-                         max_volatility=1.0,
-                         apply_benchmark=True,
-                         cost_bps=10.0,
-                         slippage_bps=5.0):
-    """
-    Rebalancing am ersten Handelstag des Monats.
-    Filter wie Analyse. Marktübersicht im Stichtag bestimmt invest_n (gerundet).
-    Es werden genau 'invest_n' Top-Titel gleichgewichtet gekauft. Rest ignoriert.
-    """
     idx = prices.index[(prices.index >= pd.to_datetime(start_date)) & (prices.index <= pd.to_datetime(end_date))]
     if len(idx) < 260:
         return pd.DataFrame(), pd.DataFrame()
 
-    rebal_days = first_trading_days_monthly(idx)
+    rebal_days = monthly_first_trading_days(idx) if mode == "monthly" else weekly_first_trading_days(idx)
     rebal_days = [d for d in rebal_days if d >= idx.min() and d <= idx.max()]
     if len(rebal_days) < 2:
         return pd.DataFrame(), pd.DataFrame()
 
     port_val = 1.0
     weights_prev = pd.Series(0.0, index=prices.columns)
-    equity = []
-    logs = []
-
+    equity, logs = [], []
     tc = (cost_bps + slippage_bps) / 10000.0
 
     for i in range(len(rebal_days)-1):
-        asof = rebal_days[i]
-        nxt  = rebal_days[i+1]
-
+        asof, nxt = rebal_days[i], rebal_days[i+1]
         p_slice = prices.loc[:asof]
         v_slice = volumes.loc[:asof] if isinstance(volumes, pd.DataFrame) else pd.DataFrame(index=p_slice.index)
 
@@ -251,6 +236,7 @@ def run_backtest_monthly(prices: pd.DataFrame,
 
         snap = compute_indicators(p_slice, v_slice, benchmark_df=bm_slice)
         if snap.empty:
+            # Cash halten
             rets = prices.loc[asof:nxt].pct_change().fillna(0)
             gross_return = 0.0 if len(rets) <= 1 else (rets.iloc[1:] * weights_prev).sum(axis=1).add(1).prod() - 1.0
             port_val *= (1.0 + gross_return)
@@ -260,7 +246,7 @@ def run_backtest_monthly(prices: pd.DataFrame,
                          "NetRet": gross_return, "PortVal": port_val})
             continue
 
-        # Filter identisch zur Analyse
+        # Filter wie Analyse
         filt = snap.copy()
         if "Ø Volumen (60T)" in filt.columns:
             filt = filt[filt["Ø Volumen (60T)"] >= min_volume]
@@ -272,20 +258,19 @@ def run_backtest_monthly(prices: pd.DataFrame,
             filt = filt[filt["RS vs Benchmark (%)"] > 0]
         filt = filt.sort_values("Momentum-Score", ascending=False).reset_index(drop=True)
 
-        # Marktübersicht am Stichtag
+        # Marktbreite und invest_n am Stichtag
         total = len(filt)
         share = float((filt["GD200-Signal"] == "Über GD200").sum()) / total if total > 0 else 0.0
         invest_n = invest_count_from_share(share, top_n)
 
+        # Auswahl und Gewichte
         sel = filt.head(invest_n).copy() if invest_n > 0 else filt.iloc[0:0]
         new_weights = pd.Series(0.0, index=prices.columns)
         if not sel.empty:
-            w = 1.0 / len(sel)  # voll investiert in invest_n
+            w = 1.0 / len(sel)
             new_weights.loc[sel["Ticker"].values] = w
-        else:
-            new_weights[:] = 0.0  # komplett Cash
 
-        # Renditen in der Periode
+        # Periode-Rendite mit alten Gewichten
         rets = prices.loc[asof:nxt].pct_change().fillna(0)
         gross_return = (rets.iloc[1:] * weights_prev).sum(axis=1).add(1).prod() - 1.0 if len(rets) > 1 else 0.0
 
@@ -307,12 +292,12 @@ def run_backtest_monthly(prices: pd.DataFrame,
             "PortVal": float(port_val)
         })
 
+        # Rebalance für nächste Periode
         weights_prev = new_weights.copy()
 
     eq_df = pd.DataFrame(equity, columns=["Date", "Equity"]).set_index("Date")
     logs_df = pd.DataFrame(logs)
     return eq_df, logs_df
-
 
 # =========================
 # Sidebar
@@ -324,13 +309,14 @@ start_date = st.sidebar.date_input("Startdatum (Datenabruf)", value=datetime.tod
 end_date   = st.sidebar.date_input("Enddatum", value=datetime.today())
 
 st.sidebar.markdown("### Filter")
-min_volume = st.sidebar.number_input("Min. Ø Volumen (60T)", min_value=0, value=4_000_000, step=100_000)
+min_volume = st.sidebar.number_input("Min. Ø Volumen (60T)", min_value=0, value=5_000_000, step=100_000)
 max_dd52 = st.sidebar.slider("Max. Drawdown zum 52W-Hoch (%)", -100, 0, -30, step=5)
 max_volatility = st.sidebar.slider("Max. Volatilität (ann.)", 0.0, 2.0, 1.0, step=0.05)
 apply_benchmark = st.sidebar.checkbox("Nur Aktien > Benchmark (130T)", value=True)
 benchmark_ticker = st.sidebar.text_input("Benchmark-Ticker", "SPY")
 
-st.sidebar.markdown("### Backtest-Kosten (bps)")
+st.sidebar.markdown("### Backtest")
+mode = st.sidebar.radio("Rebalancing-Modus", ["monthly", "weekly"], index=0)
 cost_bps = st.sidebar.number_input("Kommission (bps)", min_value=0.0, value=10.0, step=1.0)
 slip_bps = st.sidebar.number_input("Slippage (bps)", min_value=0.0, value=5.0, step=1.0)
 
@@ -338,7 +324,7 @@ slip_bps = st.sidebar.number_input("Slippage (bps)", min_value=0.0, value=5.0, s
 # Daten laden
 # =========================
 
-st.title("Momentum – Analyse, Marktübersicht, Backtest")
+st.title("Momentum – Analyse, %>GD200 und Backtest (alter Stand)")
 
 uploaded = st.file_uploader("CSV mit **Ticker** und optional **Name**", type=["csv"])
 tickers_txt = st.text_input("Oder Ticker (kommagetrennt):", "AAPL, MSFT, TSLA, NVDA, META, AVGO, ORCL, COST, JPM, LLY")
@@ -384,6 +370,21 @@ if df.empty:
 
 df["Name"] = df["Ticker"].map(name_map).fillna(df["Ticker"])
 
+# Filter identisch wie Sidebar
+filtered = df.copy()
+filtered = filtered[filtered["Ø Volumen (60T)"] >= min_volume]
+filtered = filtered[filtered["52W-Drawdown (%)"] >= max_dd52]
+filtered = filtered[filtered["Volatilität (ann.)"] <= max_volatility]
+if apply_benchmark and "RS vs Benchmark (%)" in filtered.columns:
+    filtered = filtered[filtered["RS vs Benchmark (%)"] > 0]
+filtered = filtered.sort_values("Momentum-Score", ascending=False).reset_index(drop=True)
+filtered["Rank"] = np.arange(1, len(filtered) + 1)
+
+# Marktbreite und invest_n auf Basis des GEFILTERTEN Universums
+total = len(filtered)
+share_gd200 = (filtered["GD200-Signal"] == "Über GD200").sum() / total if total > 0 else 0.0
+invest_n = invest_count_from_share(share_gd200, top_n)
+
 # =========================
 # Tabs
 # =========================
@@ -391,89 +392,71 @@ df["Name"] = df["Ticker"].map(name_map).fillna(df["Ticker"])
 tab1, tab2, tab3 = st.tabs(["🔬 Analyse", "🧭 Handlungsempfehlungen", "📈 Backtest"])
 
 with tab1:
-    st.subheader("Analyse – Kennzahlen")
-    st.dataframe(df, use_container_width=True)
+    st.subheader("Analyse – Kennzahlen (gefiltert)")
+    st.dataframe(filtered, use_container_width=True)
+    st.markdown(
+        f"**> GD200:** {int(share_gd200*100):d}% "
+        f"({int(share_gd200*total)}/{total})  •  "
+        f"**Investiere:** {invest_n} von Top-{top_n} (Rundung)."
+    )
 
 with tab2:
     st.subheader("Handlungsempfehlungen")
-
-    total = len(df)
-    gd200_above = int((df["GD200-Signal"] == "Über GD200").sum())
-    share = gd200_above / total if total > 0 else 0.0
-
-    invest_n = invest_count_from_share(share, top_n)
-
-    st.markdown(
-        f"**Marktübersicht:** {share:.0%} der analysierten Aktien "
-        f"({gd200_above}/{total}) liegen **über dem GD200**."
-    )
-    st.markdown(
-        f"**Investiere:** **{invest_n}** von **Top-{top_n}** "
-        f"(Rundungsregel: {share:.2f}×{top_n} → {invest_n})."
-    )
-
-    st.divider()
-
-    def rec_row(row, in_port, top_limit=10):
-        t = row["Ticker"]
-        rank = row["Rank"]
+    # Kaufregel: Rank ≤ invest_n UND über GD50 UND über GD200
+    def rec_row(row, in_port, top_limit):
         over50 = row["GD50-Signal"].startswith("Über")
         over200 = row["GD200-Signal"].startswith("Über")
-
-        if t in in_port:
+        if row["Rank"] <= top_limit and over50 and over200:
+            return "🟢 Kaufen"
+        if row["Ticker"] in in_port:
             if not over50:
                 return "🔴 Verkaufen (unter GD50)"
-            if rank <= top_limit:
+            if row["Rank"] <= top_limit:
                 return "🟡 Halten"
             return "🔴 Verkaufen (nicht mehr Top)"
-        else:
-            if rank <= top_limit and over50 and over200:
-                return "🟢 Kaufen"
-            return "—"
+        return "—"
 
-    rec_df = df.copy()
-    rec_df["Handlung"] = rec_df.apply(lambda r: rec_row(r, portfolio, top_limit=max(invest_n, 0)), axis=1)
+    rec_df = filtered.copy()
+    rec_df["Handlung"] = rec_df.apply(lambda r: rec_row(r, portfolio, invest_n), axis=1)
     cols = ["Rank", "Ticker", "Name", "Momentum-Score", "GD50-Signal", "GD200-Signal", "Handlung"]
     st.dataframe(rec_df[cols], use_container_width=True)
+    st.markdown(
+        f"**Marktübersicht:** {int(share_gd200*100):d}% über GD200 → "
+        f"Investiere **{invest_n}** von **Top-{top_n}**."
+    )
 
 with tab3:
-    st.subheader("Backtest – monatlich (1. Handelstag)")
-    st.caption("Kauft pro Stichtag genau so viele Aktien wie die Marktübersicht mit Rundungsregel vorgibt.")
-
+    st.subheader(f"Backtest – {mode}")
+    st.caption("Kauft pro Stichtag genau invest_n Titel (Rundungsregel), Equal-Weight, GD-Filter identisch.")
     if st.button("▶️ Backtest starten"):
         with st.spinner("Berechne Backtest …"):
             bm_series = bm_prices.iloc[:, 0].copy() if not bm_prices.empty else None
-            eq_df, logs_df = run_backtest_monthly(
+            eq_df, logs_df = run_backtest(
                 prices, volumes, bm_series, start_date, end_date,
-                top_n=top_n,
-                min_volume=min_volume,
-                max_dd52=max_dd52,
-                max_volatility=max_volatility,
-                apply_benchmark=apply_benchmark,
-                cost_bps=cost_bps,
-                slippage_bps=slip_bps
+                top_n=top_n, min_volume=min_volume, max_dd52=max_dd52,
+                max_volatility=max_volatility, apply_benchmark=apply_benchmark,
+                cost_bps=cost_bps, slippage_bps=slip_bps, mode=mode
             )
-
         if eq_df.empty:
             st.warning("Backtest lieferte keine Werte.")
         else:
-            fig, ax = plt.subplots(figsize=(9, 4))
+            fig, ax = plt.subplots(figsize=(9,4))
             ax.plot(eq_df.index, eq_df["Equity"], label="Strategie")
             if bm_prices is not None and not bm_prices.empty:
-                bm_norm = bm_prices.iloc[:, 0].loc[eq_df.index.min():eq_df.index.max()].dropna()
+                bm_norm = bm_prices.iloc[:,0].loc[eq_df.index.min():eq_df.index.max()].dropna()
                 if not bm_norm.empty:
                     bm_norm = (bm_norm / bm_norm.iloc[0])
                     ax.plot(bm_norm.index, bm_norm.values, label=f"Benchmark ({benchmark_ticker})", alpha=0.8)
-            ax.set_title("Equity-Kurve (monatliches Rebalancing, invest_n laut Rundung)")
+            ax.set_title(f"Equity-Kurve ({mode}-Rebalancing)")
             ax.grid(True, alpha=0.3)
             ax.legend()
             st.pyplot(fig)
 
-            st.markdown("**Rebalance-Log:**")
+            st.markdown("**Rebalance-Log (pro Periode):**")
             st.dataframe(logs_df, use_container_width=True)
             st.download_button("📥 Logs (CSV)", logs_df.to_csv(index=False).encode("utf-8"),
                                "backtest_logs.csv", "text/csv")
             st.download_button("📥 Equity (CSV)", eq_df.to_csv().encode("utf-8"),
                                "backtest_equity.csv", "text/csv")
 
-st.caption("Nur Informationen. Keine Anlageberatung.")
+st.caption("Nur Informations- und Ausbildungszwecke. Keine Anlageempfehlung.")
