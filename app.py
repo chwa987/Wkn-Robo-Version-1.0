@@ -10,10 +10,9 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 
-import streamlit as st
 st.set_page_config(
     page_title="Champions Auswahl",
-    page_icon="\U0001F3C6",  # 🏆
+    page_icon="\U0001F3C6",
     layout="wide"
 )
 
@@ -23,7 +22,8 @@ st.set_page_config(
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def fetch_ohlc(ticker_list, start, end):
-    """Download OHLCV für Ticker-Liste; gibt (price_df, volume_df) zurück."""
+    """Robuster OHLCV-Download. Bulk -> Fallback per Ticker. Entfernt leere Spalten."""
+    # Tickerliste säubern
     if isinstance(ticker_list, str):
         tickers = [t.strip() for t in ticker_list.split(",") if t.strip()]
     else:
@@ -32,39 +32,99 @@ def fetch_ohlc(ticker_list, start, end):
     if not tickers:
         return pd.DataFrame(), pd.DataFrame()
 
+    # yfinance erwartet end exklusiv; +1 Tag, damit heute drin ist
+    end_plus = pd.to_datetime(end) + pd.Timedelta(days=1)
+    start_dt = pd.to_datetime(start)
+
+    def _extract_close_vol(df_any, t_sym=None):
+        """Gibt (close_series, vol_series) zurück oder (None, None)."""
+        if df_any is None or df_any.empty:
+            return None, None
+        try:
+            if isinstance(df_any.columns, pd.MultiIndex):
+                # MultiIndex: df_any['AAPL'] etc.
+                if t_sym is None:
+                    return None, None
+                sub = df_any[t_sym]
+                close = sub["Adj Close"] if "Adj Close" in sub.columns else sub.get("Close")
+                vol = sub.get("Volume")
+            else:
+                close = df_any["Adj Close"] if "Adj Close" in df_any.columns else df_any.get("Close")
+                vol = df_any.get("Volume")
+            if close is None or close.dropna().empty:
+                return None, None
+            return close.rename(t_sym if t_sym else close.name), vol.rename(t_sym if t_sym else vol.name) if vol is not None else pd.Series(dtype=float, name=t_sym)
+        except Exception:
+            return None, None
+
+    close_cols = {}
+    vol_cols = {}
+
+    # 1) Bulk-Download
+    bulk = None
     try:
-        data = yf.download(
+        bulk = yf.download(
             tickers=" ".join(tickers),
-            start=start,
-            end=end,
+            start=start_dt,
+            end=end_plus,
             group_by="ticker",
             auto_adjust=False,
             progress=False,
             threads=True,
         )
-    except Exception as e:
-        st.error(f"Fehler beim Download: {e}")
+    except Exception:
+        bulk = None
+
+    if bulk is not None and not bulk.empty:
+        # Versuche für jeden Ticker aus Bulk zu ziehen
+        for t in tickers:
+            if isinstance(bulk.columns, pd.MultiIndex):
+                if t in bulk.columns.get_level_values(0):
+                    c, v = _extract_close_vol(bulk, t)
+                else:
+                    c, v = None, None
+            else:
+                # Single-Frame für 1 Ticker
+                c, v = _extract_close_vol(bulk, t)
+            if c is not None:
+                close_cols[t] = c
+                if v is not None:
+                    vol_cols[t] = v
+
+    # 2) Fallback: einzeln nachladen, falls Bulk nichts oder nur teilweise lieferte
+    missing = [t for t in tickers if t not in close_cols]
+    for t in missing:
+        try:
+            single = yf.download(
+                tickers=t,
+                start=start_dt,
+                end=end_plus,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            c, v = _extract_close_vol(single, t)
+            if c is not None:
+                close_cols[t] = c
+                if v is not None:
+                    vol_cols[t] = v
+        except Exception:
+            continue
+
+    if not close_cols:
         return pd.DataFrame(), pd.DataFrame()
 
-    close_dict, vol_dict = {}, {}
-    for t in tickers:
-        try:
-            df = data[t].copy() if isinstance(data.columns, pd.MultiIndex) else data.copy()
-        except Exception:
-            df = data.copy()
-        if df is None or df.empty:
-            continue
-        closes = (df["Adj Close"] if "Adj Close" in df.columns else df.get("Close"))
-        vols = df.get("Volume")
-        if closes is None or closes.dropna().empty:
-            continue
-        close_dict[t] = closes.rename(t)
-        vol_dict[t] = (vols.rename(t) if vols is not None else pd.Series(dtype=float, name=t))
+    price = pd.concat(close_cols.values(), axis=1).sort_index()
+    volume = pd.concat(vol_cols.values(), axis=1).reindex(price.index) if vol_cols else pd.DataFrame(index=price.index)
 
-    price = pd.concat(close_dict.values(), axis=1) if close_dict else pd.DataFrame()
-    volume = pd.concat(vol_dict.values(), axis=1) if vol_dict else pd.DataFrame()
-    price = price.sort_index().dropna(how="all")
+    # komplett leere Spalten entfernen
+    price = price.dropna(axis=1, how="all")
+    volume = volume.drop(columns=[c for c in volume.columns if c not in price.columns], errors="ignore")
+
+    # sichtbare Lücken entfernen (nur Reihen, die komplett leer sind)
+    price = price.dropna(how="all")
     volume = volume.reindex(price.index)
+
     return price, volume
 
 def pct_change_over_window(series: pd.Series, days: int) -> float:
@@ -327,8 +387,11 @@ with st.spinner("Lade Kursdaten …"):
     prices, volumes = fetch_ohlc(tickers, start_date, end_date)
     bm_prices, _ = fetch_ohlc([benchmark_ticker], start_date, end_date)
 
+# Kurze Diagnose oben anzeigen
+st.info(f"Geladene Ticker: {len(tickers)} • Preise: {prices.shape} • Volumen: {volumes.shape}")
+
 if prices.empty:
-    st.warning("Keine Kursdaten geladen.")
+    st.warning("Keine Kursdaten geladen. Prüfe Ticker, Internet-Verbindung und Datumsspanne.")
     st.stop()
 
 # ============================================================
@@ -337,6 +400,7 @@ if prices.empty:
 
 df = compute_indicators(prices, volumes, benchmark_df=bm_prices)
 if df.empty:
+    st.warning("Kennzahlen konnten nicht berechnet werden. Zu wenig Historie?")
     st.stop()
 
 df["Name"] = df["Ticker"].map(name_map).fillna(df["Ticker"])
@@ -363,7 +427,7 @@ with tab1:
 with tab2:
     st.subheader("Handlungsempfehlungen")
 
-    # --- NEU: GD200-Breadth + empfohlene Stückzahl (x) anzeigen ---
+    # GD200-Breadth + empfohlene Stückzahl (x)
     total = len(filtered)
     if total > 0:
         gd200_above = int((filtered["GD200-Signal"] == "Über GD200").sum())
@@ -372,7 +436,6 @@ with tab2:
         gd200_above = 0
         share = 0.0
 
-    # normales Runden: >= .5 aufrunden
     invest_n = int(share * top_n + 0.5)
     invest_n = max(0, min(invest_n, top_n))
 
@@ -381,7 +444,6 @@ with tab2:
         f"({share:.1%})  •  **Investiere:** {invest_n} von Top-{top_n}"
     )
     st.divider()
-    # --- Ende NEU ---
 
     rec_df = filtered.copy()
     rec_df["Handlung"] = rec_df.apply(lambda r: "🟢 Kaufen" if r["Rank"] <= top_n else "—", axis=1)
@@ -403,7 +465,6 @@ with tab3:
         if eq_df.empty:
             st.warning("Backtest lieferte keine Werte (zu wenig Daten oder zu strenge Filter?).")
         else:
-            # Benchmark-Kurve
             fig, ax = plt.subplots(figsize=(9,4))
             ax.plot(eq_df.index, eq_df["Equity"], label="Strategie")
             if bm_prices is not None and not bm_prices.empty:
